@@ -685,6 +685,7 @@ class HttpClient:
         timeout: float,
         retries: int,
         delay: float,
+        show_curl_on_error: bool = False,
     ) -> None:
         parsed = urlsplit(base_url)
         self.hostname = parsed.hostname or ""
@@ -693,6 +694,7 @@ class HttpClient:
         self.timeout = timeout
         self.retries = retries
         self.cookie_header = cookie_header.strip()
+        self.show_curl_on_error = show_curl_on_error
         self.rate_limiter = RateLimiter(delay)
         self._local = threading.local()
 
@@ -812,6 +814,51 @@ class HttpClient:
                 pass
         return min(delay, MAX_RETRY_DELAY)
 
+    @staticmethod
+    def _shell_quote(value: str) -> str:
+        return "'" + value.replace("'", "'\"'\"'") + "'"
+
+    def build_curl_command(self, url: str, referer: str) -> str:
+        """生成与实际请求一致、可直接复制诊断的 curl 命令。"""
+        headers = self._request_headers(url, referer)
+        quote = self._shell_quote
+        parts = [f"curl -i {quote(url)}"]
+        for name in ("Accept", "Accept-Language"):
+            parts.append(f"-H {quote(f'{name.lower()}: {headers[name]}')}")
+        if self.cookie_header:
+            parts.append(f"-b {quote(self.cookie_header)}")
+        for name in (
+            "Priority",
+            "Referer",
+            "Sec-CH-UA",
+            "Sec-CH-UA-Arch",
+            "Sec-CH-UA-Bitness",
+            "Sec-CH-UA-Full-Version",
+            "Sec-CH-UA-Full-Version-List",
+            "Sec-CH-UA-Mobile",
+            "Sec-CH-UA-Model",
+            "Sec-CH-UA-Platform",
+            "Sec-CH-UA-Platform-Version",
+            "Sec-Fetch-Dest",
+            "Sec-Fetch-Mode",
+            "Sec-Fetch-Site",
+            "Sec-Fetch-User",
+            "Upgrade-Insecure-Requests",
+            "User-Agent",
+        ):
+            if name in headers:
+                parts.append(f"-H {quote(f'{name.lower()}: {headers[name]}')}")
+        return " \\\n  ".join(parts)
+
+    def _show_failed_curl(self, code: int, url: str, referer: str) -> None:
+        if not self.show_curl_on_error:
+            return
+        print(
+            f"\n[curl] HTTP {code} 的完整复现命令（包含敏感 Cookie）：\n"
+            f"{self.build_curl_command(url, referer)}\n",
+            file=sys.stderr,
+        )
+
     def fetch(self, url: str, referer: str) -> FetchResult:
         last_error: BaseException | None = None
         opener = self._opener()
@@ -844,6 +891,7 @@ class HttpClient:
                 if exc.code in {401, 403} or self._looks_like_challenge(
                     document, exc.geturl()
                 ):
+                    self._show_failed_curl(exc.code, url, referer)
                     raise AccessChallengeError(
                         f"站点返回 HTTP {exc.code}。Cookie 可能已过期，"
                         "请在浏览器重新完成验证后更新 Cookie，并保持相同的 "
@@ -852,6 +900,7 @@ class HttpClient:
                 last_error = exc
                 retryable = exc.code == 429 or 500 <= exc.code < 600
                 if not retryable or attempt >= self.retries:
+                    self._show_failed_curl(exc.code, url, referer)
                     raise ScraperError(
                         f"请求失败：HTTP {exc.code}，URL={url}"
                     ) from exc
@@ -1215,6 +1264,11 @@ def make_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="运行时隐藏输入 Cookie（优先于 Cookie 文件）",
     )
+    parser.add_argument(
+        "--show-curl-on-error",
+        action="store_true",
+        help="HTTP 最终失败时输出含当前 Cookie 和完整请求头的 curl 命令",
+    )
     return parser
 
 
@@ -1469,6 +1523,7 @@ def run(args: argparse.Namespace) -> int:
         timeout=args.timeout,
         retries=args.retries,
         delay=args.delay,
+        show_curl_on_error=args.show_curl_on_error,
     )
     page_count = resolve_page_count(args.limit, args.pages)
     existing_before = count_magnet_lines(output_path)

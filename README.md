@@ -46,6 +46,14 @@ python .\skrbt_magnet.py "三国演义" --workers 4 --search-workers 1 --delay 0
 
 不建议大幅提高并发。HTTP 429/5xx 会按指数退避重试，并让所有抓取线程共享服务端要求的冷却时间；可用 `--retries` 调整重试次数。
 
+需要手工复现最终失败的请求时，可让脚本输出对应 URL、Referer、当前 Cookie 和完整浏览器请求头：
+
+```powershell
+python .\skrbt_magnet.py "三国演义" --show-curl-on-error
+```
+
+输出命令包含敏感 Cookie，不要粘贴到公开位置；其中的 `\` 是 Bash/WSL 换行符，在 PowerShell 中可删除换行和 `\` 后执行。
+
 默认请求参数与站点搜索一致：
 
 - `sos=relevance`

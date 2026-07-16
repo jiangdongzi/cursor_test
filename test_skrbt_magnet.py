@@ -235,6 +235,19 @@ class HttpClientTests(unittest.TestCase):
         self.assertEqual(headers["Sec-CH-UA-Platform-Version"], '"19.0.0"')
         self.assertIn("application/signed-exchange", headers["Accept"])
 
+        command = client.build_curl_command(
+            "https://skrbtso.top/search?keyword=test&p=2",
+            referer,
+        )
+        self.assertIn(
+            "curl -i 'https://skrbtso.top/search?keyword=test&p=2'",
+            command,
+        )
+        self.assertIn("-b 'session=test'", command)
+        self.assertIn("-H 'referer: https://skrbtso.top/search?keyword=test&p=1'", command)
+        self.assertIn("-H 'sec-ch-ua-full-version: \"150.0.4078.65\"'", command)
+        self.assertNotIn("-H 'cookie:", command.lower())
+
     def test_503_retries_use_shared_exponential_backoff(self) -> None:
         class Headers(dict):
             def get_content_charset(self) -> str:
@@ -381,6 +394,7 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(args.retries, DEFAULT_RETRIES)
         self.assertEqual(args.delay, DEFAULT_DELAY)
         self.assertIsNone(args.pages)
+        self.assertFalse(args.show_curl_on_error)
 
     def test_resolve_page_count(self) -> None:
         self.assertEqual(resolve_page_count(120, None), 14)
