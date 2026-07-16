@@ -27,8 +27,11 @@ from urllib.request import Request, build_opener
 DEFAULT_BASE_URL = "https://skrbtso.top"
 DEFAULT_COOKIE_FILE = Path("cookie.txt")
 DEFAULT_LIMIT = 120
-DEFAULT_WORKERS = 96
-DEFAULT_SEARCH_WORKERS = 16
+DEFAULT_WORKERS = 8
+DEFAULT_SEARCH_WORKERS = 1
+DEFAULT_RETRIES = 3
+DEFAULT_DELAY = 0.2
+MAX_RETRY_DELAY = 30.0
 # 站点搜索页通常大约每页 10 条；翻页上限按此估算并留一点余量。
 DEFAULT_RESULTS_PER_PAGE = 10
 DEFAULT_USER_AGENT = (
@@ -648,19 +651,27 @@ class RateLimiter:
 
     def __init__(self, delay: float) -> None:
         self.delay = delay
-        self._lock = threading.Lock()
+        self._condition = threading.Condition()
         self._next_at = 0.0
 
     def wait(self) -> None:
-        if self.delay <= 0:
-            return
-        with self._lock:
-            now = time.monotonic()
-            wait = self._next_at - now
-            if wait > 0:
-                time.sleep(wait)
+        with self._condition:
+            while True:
                 now = time.monotonic()
-            self._next_at = now + self.delay
+                wait = self._next_at - now
+                if wait <= 0:
+                    self._next_at = now + self.delay
+                    return
+                # Condition.wait 会释放锁，使 429/503 能立即延长冷却窗口。
+                self._condition.wait(timeout=wait)
+
+    def defer(self, seconds: float) -> None:
+        """遇到限流或服务端错误时，让所有请求共享同一个冷却窗口。"""
+        if seconds <= 0:
+            return
+        with self._condition:
+            self._next_at = max(self._next_at, time.monotonic() + seconds)
+            self._condition.notify_all()
 
 
 class HttpClient:
@@ -726,9 +737,12 @@ class HttpClient:
         headers = {
             "Accept": (
                 "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                "image/avif,image/webp,image/apng,*/*;q=0.8"
+                "image/avif,image/webp,image/apng,*/*;q=0.8,"
+                "application/signed-exchange;v=b3;q=0.7"
             ),
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Accept-Language": (
+                "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6"
+            ),
             "Connection": "keep-alive",
             "Priority": "u=0, i",
             "Referer": referer,
@@ -750,21 +764,53 @@ class HttpClient:
             else "cross-site"
         )
 
-        chrome = re.search(r"(?:Chrome|Chromium)/(\d+)", self.user_agent)
-        edge = re.search(r"Edg/(\d+)", self.user_agent)
+        chrome = re.search(
+            r"(?:Chrome|Chromium)/(\d+(?:\.\d+){0,3})", self.user_agent
+        )
+        edge = re.search(r"Edg/(\d+(?:\.\d+){0,3})", self.user_agent)
         if chrome:
+            chrome_version = chrome.group(1)
+            chrome_major = chrome_version.split(".", 1)[0]
             brands = (
-                f'"Not;A=Brand";v="8", "Chromium";v="{chrome.group(1)}"'
+                f'"Not;A=Brand";v="8", "Chromium";v="{chrome_major}"'
             )
             if edge:
-                brands += f', "Microsoft Edge";v="{edge.group(1)}"'
+                edge_version = edge.group(1)
+                edge_major = edge_version.split(".", 1)[0]
+                brands += f', "Microsoft Edge";v="{edge_major}"'
             headers["Sec-CH-UA"] = brands
             headers["Sec-CH-UA-Mobile"] = "?0"
+            if self.user_agent == DEFAULT_USER_AGENT:
+                chrome_version = "150.0.7871.115"
+                edge_version = "150.0.4078.65"
+            else:
+                edge_version = edge.group(1) if edge else chrome_version
+            full_versions = (
+                '"Not;A=Brand";v="8.0.0.0", '
+                f'"Chromium";v="{chrome_version}"'
+            )
+            if edge:
+                full_versions += f', "Microsoft Edge";v="{edge_version}"'
+            headers["Sec-CH-UA-Full-Version"] = f'"{edge_version}"'
+            headers["Sec-CH-UA-Full-Version-List"] = full_versions
         if "Windows" in self.user_agent:
             headers["Sec-CH-UA-Arch"] = '"x86"'
             headers["Sec-CH-UA-Bitness"] = '"64"'
+            headers["Sec-CH-UA-Model"] = '""'
             headers["Sec-CH-UA-Platform"] = '"Windows"'
+            headers["Sec-CH-UA-Platform-Version"] = '"19.0.0"'
         return headers
+
+    @staticmethod
+    def _retry_delay(attempt: int, headers: object) -> float:
+        delay = min(MAX_RETRY_DELAY, 1.0 * (2**attempt))
+        retry_after = getattr(headers, "get", lambda *_: None)("Retry-After")
+        if retry_after:
+            try:
+                delay = max(delay, float(retry_after))
+            except (TypeError, ValueError):
+                pass
+        return min(delay, MAX_RETRY_DELAY)
 
     def fetch(self, url: str, referer: str) -> FetchResult:
         last_error: BaseException | None = None
@@ -809,13 +855,19 @@ class HttpClient:
                     raise ScraperError(
                         f"请求失败：HTTP {exc.code}，URL={url}"
                     ) from exc
+                delay = self._retry_delay(attempt, exc.headers)
+                self.rate_limiter.defer(delay)
+                print(
+                    f"[重试] HTTP {exc.code}，至少等待 {delay:g}s"
+                    f"（{attempt + 1}/{self.retries}）",
+                    file=sys.stderr,
+                )
             except (URLError, socket.timeout, TimeoutError, OSError) as exc:
                 last_error = exc
                 if attempt >= self.retries:
                     raise ScraperError(f"请求失败：{exc}，URL={url}") from exc
-
-            # 只重试一次，退避保持很短以免拖慢整体速度。
-            time.sleep(0.4)
+                delay = self._retry_delay(attempt, getattr(exc, "headers", None))
+                self.rate_limiter.defer(delay)
 
         raise ScraperError(f"请求失败：{last_error}")  # pragma: no cover
 
@@ -1120,7 +1172,10 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="单次请求超时秒数",
     )
     parser.add_argument(
-        "--retries", type=int, default=1, help="临时网络错误重试次数（默认只重试 1 次）"
+        "--retries",
+        type=int,
+        default=DEFAULT_RETRIES,
+        help="临时网络错误重试次数",
     )
     parser.add_argument(
         "--workers",
@@ -1137,8 +1192,8 @@ def make_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--delay",
         type=non_negative_float,
-        default=0.0,
-        help="两次 HTTP 请求的最小间隔秒数（全局限流，默认 0 以拉满并发）",
+        default=DEFAULT_DELAY,
+        help="两次 HTTP 请求的全局最小间隔秒数",
     )
     parser.add_argument(
         "--user-agent",
@@ -1186,8 +1241,13 @@ def collect_search_results(
 
     def fetch_page(page: int) -> tuple[int, FetchResult | None, list[SearchResult], str]:
         search_url = build_search_url(base_url, keyword, page, sos, sofs)
+        referer = (
+            base_url
+            if page <= 1
+            else build_search_url(base_url, keyword, page - 1, sos, sofs)
+        )
         try:
-            response = client.fetch(search_url, base_url)
+            response = client.fetch(search_url, referer)
         except AccessChallengeError:
             raise
         except ScraperError as exc:

@@ -26,7 +26,7 @@ JSESSIONID=...; cf_clearance=...; ...
 
 ### 2. 执行搜索
 
-默认会处理 **120 条**搜索结果，使用 **64 线程并发**抓取，从 `cookie.txt` 读 Cookie，并**自动追加写入当前工作目录的 `magnets.txt`**（不必写 `-o`）：
+默认会处理 **120 条**搜索结果，使用 **8 个详情线程**、**1 个搜索线程**和 **0.2 秒全局请求间隔**抓取，从 `cookie.txt` 读 Cookie，并**自动追加写入当前工作目录的 `magnets.txt`**（不必写 `-o`）：
 
 ```powershell
 python .\skrbt_magnet.py "三国演义"
@@ -38,17 +38,13 @@ python .\skrbt_magnet.py "三国演义"
 python E:\work\cursor_test\skrbt_magnet.py "naughty america" --limit 2000 -o E:\work\cursor_test\magnets.txt
 ```
 
-若仍被站点限流，可适当降并发或加一点间隔：
+若仍被站点限流，可继续降低并发或增加间隔：
 
 ```powershell
-python .\skrbt_magnet.py "三国演义" --workers 32 --delay 0.05
+python .\skrbt_magnet.py "三国演义" --workers 4 --search-workers 1 --delay 0.5
 ```
 
-想更快可继续提高并发：
-
-```powershell
-python .\skrbt_magnet.py "三国演义" --workers 128
-```
+不建议大幅提高并发。HTTP 429/5xx 会按指数退避重试，并让所有抓取线程共享服务端要求的冷却时间；可用 `--retries` 调整重试次数。
 
 默认请求参数与站点搜索一致：
 

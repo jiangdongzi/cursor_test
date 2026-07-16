@@ -1,15 +1,24 @@
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError
 
 from skrbt_magnet import (
     DEFAULT_COOKIE_FILE,
+    DEFAULT_DELAY,
     DEFAULT_LIMIT,
+    DEFAULT_RETRIES,
     DEFAULT_SEARCH_WORKERS,
+    DEFAULT_USER_AGENT,
     DEFAULT_WORKERS,
     DetailPage,
+    FetchResult,
+    HttpClient,
     MagnetAppender,
+    build_search_url,
     build_sofs_filter,
+    collect_search_results,
     decide_by_size,
     load_cookie_file,
     make_argument_parser,
@@ -196,6 +205,142 @@ class HtmlParsingTests(unittest.TestCase):
         self.assertFalse(skip.known)
 
 
+class HttpClientTests(unittest.TestCase):
+    @staticmethod
+    def make_client(*, retries: int = 0) -> HttpClient:
+        return HttpClient(
+            base_url="https://skrbtso.top",
+            cookie_header="session=test",
+            user_agent=DEFAULT_USER_AGENT,
+            timeout=1,
+            retries=retries,
+            delay=0,
+        )
+
+    def test_default_headers_match_browser_request(self) -> None:
+        client = self.make_client()
+        referer = "https://skrbtso.top/search?keyword=test&p=1"
+        headers = client._request_headers(
+            "https://skrbtso.top/search?keyword=test&p=2",
+            referer,
+        )
+
+        self.assertEqual(headers["Referer"], referer)
+        self.assertEqual(headers["Sec-Fetch-Site"], "same-origin")
+        self.assertEqual(headers["Sec-CH-UA-Full-Version"], '"150.0.4078.65"')
+        self.assertIn(
+            '"Chromium";v="150.0.7871.115"',
+            headers["Sec-CH-UA-Full-Version-List"],
+        )
+        self.assertEqual(headers["Sec-CH-UA-Platform-Version"], '"19.0.0"')
+        self.assertIn("application/signed-exchange", headers["Accept"])
+
+    def test_503_retries_use_shared_exponential_backoff(self) -> None:
+        class Headers(dict):
+            def get_content_charset(self) -> str:
+                return "utf-8"
+
+        class Response:
+            headers = Headers()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                return None
+
+            def read(self, _limit: int) -> bytes:
+                return b"<html>ok</html>"
+
+            def geturl(self) -> str:
+                return "https://skrbtso.top/detail/abc"
+
+        class FlakyOpener:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def open(self, request, timeout: float):
+                self.calls += 1
+                if self.calls <= 2:
+                    headers = Headers()
+                    if self.calls == 1:
+                        headers["Retry-After"] = "3"
+                    raise HTTPError(
+                        request.full_url,
+                        503,
+                        "Service Unavailable",
+                        headers,
+                        BytesIO(b"temporarily unavailable"),
+                    )
+                return Response()
+
+        class RecordingLimiter:
+            def __init__(self) -> None:
+                self.deferrals: list[float] = []
+
+            def wait(self) -> None:
+                pass
+
+            def defer(self, seconds: float) -> None:
+                self.deferrals.append(seconds)
+
+        client = self.make_client(retries=2)
+        opener = FlakyOpener()
+        limiter = RecordingLimiter()
+        client._local.opener = opener
+        client.rate_limiter = limiter
+
+        result = client.fetch(
+            "https://skrbtso.top/detail/abc",
+            "https://skrbtso.top/search?keyword=test&p=1",
+        )
+
+        self.assertEqual(result.document, "<html>ok</html>")
+        self.assertEqual(opener.calls, 3)
+        self.assertEqual(limiter.deferrals, [3.0, 2.0])
+
+
+class SearchRequestTests(unittest.TestCase):
+    def test_search_pages_use_previous_page_as_referer(self) -> None:
+        class RecordingClient:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            def fetch(self, url: str, referer: str) -> FetchResult:
+                self.calls.append((url, referer))
+                return FetchResult(
+                    document='<a class="rrt" href="/detail/abc">result</a>',
+                    final_url=url,
+                )
+
+        base_url = "https://skrbtso.top"
+        client = RecordingClient()
+        collect_search_results(
+            client,
+            base_url=base_url,
+            keyword="三国演义",
+            start_page=1,
+            page_count=3,
+            limit=10,
+            sos="relevance",
+            sofs="all",
+            search_workers=1,
+        )
+
+        pages = [
+            build_search_url(base_url, "三国演义", page, "relevance", "all")
+            for page in range(1, 4)
+        ]
+        self.assertEqual(
+            client.calls,
+            [
+                (pages[0], base_url),
+                (pages[1], pages[0]),
+                (pages[2], pages[1]),
+            ],
+        )
+
+
 class OutputTests(unittest.TestCase):
     def test_append_and_deduplicate_by_infohash(self) -> None:
         first = f"magnet:?xt=urn:btih:{HASH_A}&dn=one"
@@ -233,8 +378,8 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(args.cookie_file, DEFAULT_COOKIE_FILE)
         self.assertEqual(args.workers, DEFAULT_WORKERS)
         self.assertEqual(args.search_workers, DEFAULT_SEARCH_WORKERS)
-        self.assertEqual(args.retries, 1)
-        self.assertEqual(args.delay, 0.0)
+        self.assertEqual(args.retries, DEFAULT_RETRIES)
+        self.assertEqual(args.delay, DEFAULT_DELAY)
         self.assertIsNone(args.pages)
 
     def test_resolve_page_count(self) -> None:
