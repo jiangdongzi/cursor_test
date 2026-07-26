@@ -4,11 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import base64
 import gzip
 import html
+import json
 import os
 import re
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -39,6 +44,9 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0"
 )
+DEFAULT_CHROMIUM_FULL_VERSION = "150.0.7871.187"
+DEFAULT_EDGE_FULL_VERSION = "150.0.4078.99"
+DEFAULT_WINDOWS_PLATFORM_VERSION = "10.0.0"
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 
 SIZE_RE = re.compile(
@@ -674,6 +682,150 @@ class RateLimiter:
             self._condition.notify_all()
 
 
+class EdgeBrowserClient:
+    """通过 Windows Edge 和 CDP 获取页面，保留真实浏览器网络指纹。"""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        cookie_header: str,
+        timeout: float,
+        edge_path: str,
+    ) -> None:
+        powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+        if not powershell:
+            raise ScraperError(
+                "未找到 PowerShell，无法启动 Edge 浏览器后端；"
+                "可使用 --http-backend urllib 禁用自动回退"
+            )
+        helper = Path(__file__).resolve().parent / "edge_browser_fetch.ps1"
+        if not helper.exists():
+            raise ScraperError(f"缺少 Edge helper：{helper}")
+
+        command = [
+            powershell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(helper),
+        ]
+        try:
+            self._process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
+            )
+        except OSError as exc:
+            raise ScraperError(f"无法启动 Edge helper：{exc}") from exc
+        self._lock = threading.Lock()
+        self._closed = False
+        atexit.register(self.close)
+
+        response = self._exchange(
+            {
+                "cookie": cookie_header,
+                "base_url": base_url,
+                "timeout": timeout,
+                "edge_path": edge_path,
+            }
+        )
+        if not response.get("ok") or not response.get("ready"):
+            error = str(response.get("error", "未知错误"))
+            self.close()
+            if "Microsoft Edge is running" in error:
+                raise AccessChallengeError(
+                    "检测到 Edge 正在运行。请完全退出所有 Edge 进程后重新执行；"
+                    "脚本需要直接复用浏览器中已通过验证的配置。"
+                )
+            raise ScraperError(
+                f"Edge 浏览器后端启动失败：{error}"
+            )
+        print(f"[HTTP] 已自动切换到真实浏览器后端（{response.get('browser', 'Edge')}）")
+        if response.get("profile_mode") == "temporary":
+            print(
+                "[HTTP] Edge 当前正在运行，只能使用临时配置。若仍出现验证，"
+                "请完全退出所有 Edge 进程后重新执行本命令。"
+            )
+
+    def _exchange(self, payload: dict[str, object]) -> dict[str, object]:
+        if self._closed:
+            raise ScraperError("Edge 浏览器后端已关闭")
+        stdin = self._process.stdin
+        stdout = self._process.stdout
+        if stdin is None or stdout is None:
+            raise ScraperError("Edge helper 管道不可用")
+        with self._lock:
+            try:
+                stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                stdin.flush()
+                line = stdout.readline()
+            except (BrokenPipeError, OSError) as exc:
+                raise ScraperError(f"Edge helper 通信失败：{exc}") from exc
+        if not line:
+            stderr = ""
+            if self._process.stderr is not None:
+                stderr = self._process.stderr.read().strip()
+            raise ScraperError(
+                "Edge helper 意外退出"
+                + (f"：{stderr[-1000:]}" if stderr else "")
+            )
+        try:
+            response = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ScraperError(f"Edge helper 返回了无效数据：{line[:200]}") from exc
+        if not isinstance(response, dict):
+            raise ScraperError("Edge helper 返回格式错误")
+        return response
+
+    def fetch(self, url: str, referer: str) -> FetchResult:
+        response = self._exchange(
+            {
+                "command": "fetch",
+                "url": url,
+                "referer": referer,
+            }
+        )
+        if not response.get("ok"):
+            raise ScraperError(
+                f"Edge 页面请求失败：{response.get('error', '未知错误')}，URL={url}"
+            )
+        try:
+            document = base64.b64decode(
+                str(response.get("document_b64", "")), validate=True
+            ).decode("utf-8")
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ScraperError("Edge helper 返回的页面内容无效") from exc
+        return FetchResult(
+            document=document,
+            final_url=str(response.get("final_url") or url),
+        )
+
+    def close(self) -> None:
+        if getattr(self, "_closed", True):
+            return
+        self._closed = True
+        process = self._process
+        try:
+            if process.stdin is not None:
+                process.stdin.write('{"command":"close"}\n')
+                process.stdin.flush()
+                process.stdin.close()
+            process.wait(timeout=5)
+        except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+            process.kill()
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+
+
 class HttpClient:
     """线程安全的 HTTP 客户端：Cookie 作为静态头发送，避免共享 CookieJar 竞态。"""
 
@@ -686,6 +838,8 @@ class HttpClient:
         retries: int,
         delay: float,
         show_curl_on_error: bool = False,
+        http_backend: str = "auto",
+        edge_path: str = "",
     ) -> None:
         parsed = urlsplit(base_url)
         self.hostname = parsed.hostname or ""
@@ -695,8 +849,12 @@ class HttpClient:
         self.retries = retries
         self.cookie_header = cookie_header.strip()
         self.show_curl_on_error = show_curl_on_error
+        self.http_backend = http_backend
+        self.edge_path = edge_path
         self.rate_limiter = RateLimiter(delay)
         self._local = threading.local()
+        self._edge_client: EdgeBrowserClient | None = None
+        self._edge_lock = threading.Lock()
 
     def _opener(self):
         opener = getattr(self._local, "opener", None)
@@ -745,6 +903,7 @@ class HttpClient:
             "Accept-Language": (
                 "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6"
             ),
+            "Cache-Control": "max-age=0",
             "Connection": "keep-alive",
             "Priority": "u=0, i",
             "Referer": referer,
@@ -783,8 +942,8 @@ class HttpClient:
             headers["Sec-CH-UA"] = brands
             headers["Sec-CH-UA-Mobile"] = "?0"
             if self.user_agent == DEFAULT_USER_AGENT:
-                chrome_version = "150.0.7871.115"
-                edge_version = "150.0.4078.65"
+                chrome_version = DEFAULT_CHROMIUM_FULL_VERSION
+                edge_version = DEFAULT_EDGE_FULL_VERSION
             else:
                 edge_version = edge.group(1) if edge else chrome_version
             full_versions = (
@@ -800,7 +959,9 @@ class HttpClient:
             headers["Sec-CH-UA-Bitness"] = '"64"'
             headers["Sec-CH-UA-Model"] = '""'
             headers["Sec-CH-UA-Platform"] = '"Windows"'
-            headers["Sec-CH-UA-Platform-Version"] = '"19.0.0"'
+            headers["Sec-CH-UA-Platform-Version"] = (
+                f'"{DEFAULT_WINDOWS_PLATFORM_VERSION}"'
+            )
         return headers
 
     @staticmethod
@@ -823,7 +984,7 @@ class HttpClient:
         headers = self._request_headers(url, referer)
         quote = self._shell_quote
         parts = [f"curl -i {quote(url)}"]
-        for name in ("Accept", "Accept-Language"):
+        for name in ("Accept", "Accept-Language", "Cache-Control"):
             parts.append(f"-H {quote(f'{name.lower()}: {headers[name]}')}")
         if self.cookie_header:
             parts.append(f"-b {quote(self.cookie_header)}")
@@ -859,7 +1020,7 @@ class HttpClient:
             file=sys.stderr,
         )
 
-    def fetch(self, url: str, referer: str) -> FetchResult:
+    def _fetch_direct(self, url: str, referer: str) -> FetchResult:
         last_error: BaseException | None = None
         opener = self._opener()
         for attempt in range(self.retries + 1):
@@ -878,6 +1039,15 @@ class HttpClient:
                         )
                     document = self._decode_body(body, response.headers)
                     final_url = response.geturl()
+                    final_host = _normalized_host(final_url)
+                    expected_host = _normalized_host(url)
+                    if not (
+                        final_host == expected_host
+                        or final_host.endswith(f".{expected_host}")
+                    ):
+                        raise AccessChallengeError(
+                            f"站点把请求跨域重定向到了 {final_url}"
+                        )
                     if self._looks_like_challenge(document, final_url):
                         raise AccessChallengeError(
                             "站点返回了 Cloudflare/验证码页面。请先在浏览器完成"
@@ -888,8 +1058,14 @@ class HttpClient:
             except HTTPError as exc:
                 body = exc.read(MAX_RESPONSE_BYTES)
                 document = self._decode_body(body, exc.headers)
+                error_url = exc.geturl()
+                if _normalized_host(error_url) != _normalized_host(url):
+                    raise AccessChallengeError(
+                        f"站点把请求跨域重定向到了 {error_url}，"
+                        f"随后返回 HTTP {exc.code}"
+                    ) from exc
                 if exc.code in {401, 403} or self._looks_like_challenge(
-                    document, exc.geturl()
+                    document, error_url
                 ):
                     self._show_failed_curl(exc.code, url, referer)
                     raise AccessChallengeError(
@@ -919,6 +1095,59 @@ class HttpClient:
                 self.rate_limiter.defer(delay)
 
         raise ScraperError(f"请求失败：{last_error}")  # pragma: no cover
+
+    def _get_edge_client(self) -> EdgeBrowserClient:
+        with self._edge_lock:
+            if self._edge_client is None:
+                self._edge_client = EdgeBrowserClient(
+                    base_url=(
+                        f"https://{self.hostname}"
+                        if self.secure
+                        else f"http://{self.hostname}"
+                    ),
+                    cookie_header=self.cookie_header,
+                    timeout=self.timeout,
+                    edge_path=self.edge_path,
+                )
+            return self._edge_client
+
+    def _fetch_edge(self, url: str, referer: str) -> FetchResult:
+        result = self._get_edge_client().fetch(url, referer)
+        final_host = _normalized_host(result.final_url)
+        expected_host = _normalized_host(url)
+        if not (
+            final_host == expected_host
+            or final_host.endswith(f".{expected_host}")
+        ):
+            raise AccessChallengeError(
+                f"真实 Edge 也被跨域重定向到了 {result.final_url}。"
+                "请完全退出所有 Edge 进程后重新执行本命令。"
+            )
+        if self._looks_like_challenge(result.document, result.final_url):
+            raise AccessChallengeError(
+                "真实 Edge 仍然收到了 Cloudflare/验证码页面。"
+                "请完全退出所有 Edge 进程后重新执行本命令，"
+                "脚本将直接使用已验证的浏览器配置。"
+            )
+        return result
+
+    def fetch(self, url: str, referer: str) -> FetchResult:
+        if self.http_backend == "edge" or self._edge_client is not None:
+            self.rate_limiter.wait()
+            return self._fetch_edge(url, referer)
+        try:
+            return self._fetch_direct(url, referer)
+        except AccessChallengeError:
+            if self.http_backend != "auto":
+                raise
+            self.rate_limiter.wait()
+            return self._fetch_edge(url, referer)
+
+    def close(self) -> None:
+        with self._edge_lock:
+            if self._edge_client is not None:
+                self._edge_client.close()
+                self._edge_client = None
 
 
 class MagnetAppender:
@@ -1269,6 +1498,20 @@ def make_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="HTTP 最终失败时输出含当前 Cookie 和完整请求头的 curl 命令",
     )
+    parser.add_argument(
+        "--http-backend",
+        choices=("auto", "urllib", "edge"),
+        default="auto",
+        help=(
+            "HTTP 后端；auto 遇到验证或广告跳转时自动切换到 Windows Edge，"
+            "urllib 禁用回退，edge 始终使用真实浏览器"
+        ),
+    )
+    parser.add_argument(
+        "--edge-path",
+        default="",
+        help="Windows msedge.exe 路径；通常可自动发现",
+    )
     return parser
 
 
@@ -1296,7 +1539,7 @@ def collect_search_results(
     def fetch_page(page: int) -> tuple[int, FetchResult | None, list[SearchResult], str]:
         search_url = build_search_url(base_url, keyword, page, sos, sofs)
         referer = (
-            base_url
+            f"{base_url}/recaptcha/v4/challenge?url={base_url}&s=1"
             if page <= 1
             else build_search_url(base_url, keyword, page - 1, sos, sofs)
         )
@@ -1524,6 +1767,8 @@ def run(args: argparse.Namespace) -> int:
         retries=args.retries,
         delay=args.delay,
         show_curl_on_error=args.show_curl_on_error,
+        http_backend=args.http_backend,
+        edge_path=args.edge_path,
     )
     page_count = resolve_page_count(args.limit, args.pages)
     existing_before = count_magnet_lines(output_path)
@@ -1639,6 +1884,7 @@ def run(args: argparse.Namespace) -> int:
             "[提示] 大半结果被本地大小规则过滤了。"
             "可试：--match-total-size  或  --min-file-size 0"
         )
+    client.close()
     return 0
 
 

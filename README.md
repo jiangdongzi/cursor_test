@@ -46,6 +46,24 @@ python .\skrbt_magnet.py "三国演义" --workers 4 --search-workers 1 --delay 0
 
 不建议大幅提高并发。HTTP 429/5xx 会按指数退避重试，并让所有抓取线程共享服务端要求的冷却时间；可用 `--retries` 调整重试次数。
 
+当普通 Python 请求被 Cloudflare 拦截或被跳转到广告域名时，默认的
+`--http-backend auto` 会在 WSL 中自动启动 Windows Edge，以真实浏览器
+网络指纹继续请求。为了直接复用浏览器中已经验证的配置，运行脚本前需要
+**完全退出所有 Edge 进程**（不只是关闭当前标签页）。脚本只会在后台启动
+无界面的 Edge 进程，完成后自动关闭，不会弹出浏览器窗口。首个搜索页通过
+浏览器导航加载，后续搜索页和详情页在同一浏览器会话内直接请求，避免广告
+弹窗和页面跳转导致详情任务卡住。
+
+也可以显式选择后端：
+
+```powershell
+# 始终使用 Edge
+python .\skrbt_magnet.py "三国演义" --http-backend edge
+
+# 禁止 Edge 回退，只使用 Python urllib
+python .\skrbt_magnet.py "三国演义" --http-backend urllib
+```
+
 需要手工复现最终失败的请求时，可让脚本输出对应 URL、Referer、当前 Cookie 和完整浏览器请求头：
 
 ```powershell

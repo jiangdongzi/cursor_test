@@ -227,12 +227,13 @@ class HttpClientTests(unittest.TestCase):
 
         self.assertEqual(headers["Referer"], referer)
         self.assertEqual(headers["Sec-Fetch-Site"], "same-origin")
-        self.assertEqual(headers["Sec-CH-UA-Full-Version"], '"150.0.4078.65"')
+        self.assertEqual(headers["Sec-CH-UA-Full-Version"], '"150.0.4078.99"')
         self.assertIn(
-            '"Chromium";v="150.0.7871.115"',
+            '"Chromium";v="150.0.7871.187"',
             headers["Sec-CH-UA-Full-Version-List"],
         )
-        self.assertEqual(headers["Sec-CH-UA-Platform-Version"], '"19.0.0"')
+        self.assertEqual(headers["Sec-CH-UA-Platform-Version"], '"10.0.0"')
+        self.assertEqual(headers["Cache-Control"], "max-age=0")
         self.assertIn("application/signed-exchange", headers["Accept"])
 
         command = client.build_curl_command(
@@ -245,7 +246,8 @@ class HttpClientTests(unittest.TestCase):
         )
         self.assertIn("-b 'session=test'", command)
         self.assertIn("-H 'referer: https://skrbtso.top/search?keyword=test&p=1'", command)
-        self.assertIn("-H 'sec-ch-ua-full-version: \"150.0.4078.65\"'", command)
+        self.assertIn("-H 'cache-control: max-age=0'", command)
+        self.assertIn("-H 'sec-ch-ua-full-version: \"150.0.4078.99\"'", command)
         self.assertNotIn("-H 'cookie:", command.lower())
 
     def test_503_retries_use_shared_exponential_backoff(self) -> None:
@@ -347,7 +349,11 @@ class SearchRequestTests(unittest.TestCase):
         self.assertEqual(
             client.calls,
             [
-                (pages[0], base_url),
+                (
+                    pages[0],
+                    f"{base_url}/recaptcha/v4/challenge?"
+                    f"url={base_url}&s=1",
+                ),
                 (pages[1], pages[0]),
                 (pages[2], pages[1]),
             ],
@@ -393,6 +399,7 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(args.search_workers, DEFAULT_SEARCH_WORKERS)
         self.assertEqual(args.retries, DEFAULT_RETRIES)
         self.assertEqual(args.delay, DEFAULT_DELAY)
+        self.assertEqual(args.http_backend, "auto")
         self.assertIsNone(args.pages)
         self.assertFalse(args.show_curl_on_error)
 
